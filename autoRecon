@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""
+AutoRecon V1.0
+A reconnaissance automation tool that chains together common bug bounty
+recon tools (subfinder, sublist3r, amass, ffuf, httpx, katana, waybackurls,
+linkfinder, feroxbuster, Arjun) and optionally scaffolds an OWASP WSTG
+folder structure for organizing your testing notes.
+
+Created by Ahmed Nasser (shadow64)
+
+Requires the following tools to be installed and on PATH (only the ones
+you actually use need to be present -- missing tools are skipped with a
+warning rather than crashing the script):
+    subfinder   -> go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+    amass       -> go install -v github.com/owasp-amass/amass/v4/...@master
+    httpx       -> go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+    katana      -> go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+    ffuf        -> go install -v github.com/ffuf/ffuf/v2@latest
+    feroxbuster -> https://github.com/epi052/feroxbuster
+    waybackurls -> go install -v github.com/tomnomnom/waybackurls@latest
+    sublist3r   -> pip install sublist3r  (or clone the repo)
+    linkfinder  -> clone https://github.com/GerbenJavado/LinkFinder
+    arjun       -> pip install arjun
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from urllib.parse import urlparse
+
+import requests
+
+INFO = "\033[94m[INFO]\033[0m"
+WARN = "\033[93m[WARN]\033[0m"
+ERR = "\033[91m[ERR]\033[0m"
+OK = "\033[92m[OK]\033[0m"
+
+WSTG_SECTIONS = {
+    "WSTG-INFO": "Information Gathering",
+    "WSTG-CONF": "Configuration and Deployment Management Testing",
+    "WSTG-IDNT": "Identity Management Testing",
+    "WSTG-ATHN": "Authentication Testing",
+    "WSTG-ATHZ": "Authorization Testing",
+    "WSTG-SESS": "Session Management Testing",
+    "WSTG-INPV": "Input Validation Testing",
+    "WSTG-ERRH": "Error Handling",
+    "WSTG-CRYP": "Cryptography",
+    "WSTG-BUSL": "Business Logic Testing",
+    "WSTG-CLNT": "Client-side Testing",
+    "WSTG-APIT": "API Testing",
+}
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+def check_tool(name):
+    """Return True if a tool is available on PATH."""
+    return shutil.which(name) is not None
+
+
+def run_tool(cmd, tool_name):
+    """Run an external tool safely with a proper argument list (no shell)."""
+    if not check_tool(cmd[0]):
+        print(f"{ERR} {tool_name} not found on PATH, skipping.")
+        return False
+    print(f"{INFO} running {tool_name} ...")
+    try:
+        subprocess.run(cmd, capture_output=True, check=True, text=True)
+        print(f"{OK} {tool_name} finished successfully.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"{ERR} {tool_name} failed: {e.stderr.strip() if e.stderr else e}")
+        return False
+    except FileNotFoundError:
+        print(f"{ERR} {tool_name} executable not found.")
+        return False
+
+
+def get_domain(target):
+    parsed = urlparse(target)
+    return parsed.netloc if parsed.netloc else parsed.path
+
+
+def check_target_alive(target):
+    try:
+        response = requests.get(target, timeout=10)
+    except requests.exceptions.RequestException as e:
+        print(f"{ERR} could not reach target: {e}")
+        sys.exit(1)
+    if response.status_code >= 500:
+        print(f"{WARN} target returned status {response.status_code}, it may be unstable.")
+    else:
+        print(f"{INFO} target is reachable, status code {response.status_code}.")
+    return response
+
+
+def make_outdir(domain):
+    outdir = os.path.join("results", domain)
+    os.makedirs(outdir, exist_ok=True)
+    return outdir
+
+
+def merge_lines(files, outdir, out_name, label):
+    merged = set()
+    for f in files:
+        if f and os.path.isfile(f):
+            with open(f) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        merged.add(line)
+    out = os.path.join(outdir, out_name)
+    with open(out, "w") as fh:
+        fh.write("\n".join(sorted(merged)))
+    print(f"{INFO} merged {len(merged)} unique {label} into {out}")
+    return out
+
+
+# --------------------------------------------------------------------------
+# Subdomain enumeration
+# --------------------------------------------------------------------------
+
+def run_subfinder(domain, outdir):
+    out = os.path.join(outdir, "subfinder.txt")
+    cmd = ["subfinder", "-d", domain, "-all", "-silent", "-o", out]
+    run_tool(cmd, "subfinder")
+    return out
+
+
+def run_sublist3r(domain, outdir):
+    out = os.path.join(outdir, "sublist3r.txt")
+    cmd = ["sublist3r", "-d", domain, "-o", out]
+    run_tool(cmd, "sublist3r")
+    return out
+
+
+def run_amass(domain, outdir):
+    out = os.path.join(outdir, "amass.txt")
+    cmd = ["amass", "enum", "-passive", "-d", domain, "-o", out]
+    run_tool(cmd, "amass")
+    return out
+
+
+def run_ffuf_subs(domain, wordlist, outdir):
+    if not wordlist:
+        print(f"{WARN} no subdomain wordlist provided (-ws), skipping ffuf subdomain brute force.")
+        return None
+    raw_out = os.path.join(outdir, "ffuf_subs.csv")
+    target_url = f"https://FUZZ.{domain}"
+    cmd = ["ffuf", "-w", wordlist, "-u", target_url, "-mc", "200,301,302,403",
+           "-of", "csv", "-o", raw_out, "-s"]
+    success = run_tool(cmd, "ffuf (subdomains)")
+    if not success or not os.path.isfile(raw_out):
+        return None
+    # Pull the discovered hostnames out of ffuf's csv report into a plain list
+    found = set()
+    with open(raw_out) as fh:
+        for line in fh:
+            parts = line.strip().split(",")
+            if parts and parts[0] and parts[0] != "FUZZ":
+                found.add(f"{parts[0]}.{domain}")
+    parsed_out = os.path.join(outdir, "ffuf_subs.txt")
+    with open(parsed_out, "w") as fh:
+        fh.write("\n".join(sorted(found)))
+    return parsed_out
+
+
+# --------------------------------------------------------------------------
+# Probing alive hosts
+# --------------------------------------------------------------------------
+
+def run_httpx(subdomains_file, outdir):
+    if not subdomains_file or not os.path.isfile(subdomains_file) or os.path.getsize(subdomains_file) == 0:
+        print(f"{WARN} no subdomains to probe, skipping httpx.")
+        return None
+    out = os.path.join(outdir, "alive_hosts.txt")
+    cmd = ["httpx", "-l", subdomains_file, "-silent", "-o", out]
+    run_tool(cmd, "httpx")
+    return out
+
+
+# --------------------------------------------------------------------------
+# URL discovery
+# --------------------------------------------------------------------------
+
+def run_katana(alive_hosts_file, outdir):
+    if not alive_hosts_file or not os.path.isfile(alive_hosts_file):
+        print(f"{WARN} no alive hosts file, skipping katana.")
+        return None
+    out = os.path.join(outdir, "katana_urls.txt")
+    cmd = ["katana", "-list", alive_hosts_file, "-silent", "-o", out]
+    run_tool(cmd, "katana")
+    return out
+
+
+def run_waybackurls(domain, outdir):
+    if not check_tool("waybackurls"):
+        print(f"{ERR} waybackurls not found on PATH, skipping.")
+        return None
+    out = os.path.join(outdir, "wayback_urls.txt")
+    print(f"{INFO} running waybackurls ...")
+    try:
+        result = subprocess.run(["waybackurls"], input=domain + "\n",
+                                 capture_output=True, check=True, text=True)
+        with open(out, "w") as fh:
+            fh.write(result.stdout)
+        print(f"{OK} waybackurls finished successfully.")
+        return out
+    except subprocess.CalledProcessError as e:
+        print(f"{ERR} waybackurls failed: {e.stderr.strip() if e.stderr else e}")
+        return None
+
+
+# --------------------------------------------------------------------------
+# JS analysis
+# --------------------------------------------------------------------------
+
+def run_linkfinder(all_urls_file, outdir):
+    if not all_urls_file or not os.path.isfile(all_urls_file):
+        return None
+    binary = "linkfinder" if check_tool("linkfinder") else ("linkfinder.py" if check_tool("linkfinder.py") else None)
+    if binary is None:
+        print(f"{ERR} linkfinder not found on PATH, skipping.")
+        return None
+
+    js_files = []
+    with open(all_urls_file) as fh:
+        for line in fh:
+            line = line.strip()
+            if line.lower().endswith(".js"):
+                js_files.append(line)
+
+    if not js_files:
+        print(f"{WARN} no JS files found in discovered URLs, skipping linkfinder.")
+        return None
+
+    out = os.path.join(outdir, "linkfinder_results.txt")
+    with open(out, "w") as outfh:
+        for js in js_files:
+            cmd = [binary, "-i", js, "-o", "cli"]
+            try:
+                result = subprocess.run(cmd, capture_output=True, check=True, text=True)
+                outfh.write(f"# {js}\n{result.stdout}\n\n")
+            except subprocess.CalledProcessError as e:
+                print(f"{WARN} linkfinder failed on {js}: {e.stderr.strip() if e.stderr else e}")
+    print(f"{OK} linkfinder finished, results saved to {out}")
+    return out
+
+
+def download_js_files(all_urls_file, outdir):
+    """Download every discovered .js file into its own folder for offline review."""
+    if not all_urls_file or not os.path.isfile(all_urls_file):
+        print(f"{WARN} no URLs file found, skipping JS download.")
+        return None
+
+    js_urls = []
+    with open(all_urls_file) as fh:
+        for line in fh:
+            line = line.strip()
+            if line.lower().split("?")[0].endswith(".js"):
+                js_urls.append(line)
+
+    if not js_urls:
+        print(f"{WARN} no JS files found in discovered URLs, skipping JS download.")
+        return None
+
+    js_dir = os.path.join(outdir, "js_files")
+    os.makedirs(js_dir, exist_ok=True)
+    print(f"{INFO} downloading {len(js_urls)} JS file(s) to {js_dir} ...")
+
+    downloaded = 0
+    for url in js_urls:
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                print(f"{WARN} {url} returned status {resp.status_code}, skipped.")
+                continue
+            parsed = urlparse(url)
+            safe_name = (parsed.netloc + parsed.path).strip("/").replace("/", "_")
+            if not safe_name.lower().endswith(".js"):
+                safe_name += ".js"
+            file_path = os.path.join(js_dir, safe_name)
+            # avoid overwriting files that hash to the same name
+            base, ext = os.path.splitext(file_path)
+            counter = 1
+            while os.path.exists(file_path):
+                file_path = f"{base}_{counter}{ext}"
+                counter += 1
+            with open(file_path, "wb") as f:
+                f.write(resp.content)
+            downloaded += 1
+        except requests.exceptions.RequestException as e:
+            print(f"{WARN} failed to download {url}: {e}")
+
+    print(f"{OK} downloaded {downloaded}/{len(js_urls)} JS files to {js_dir}")
+    return js_dir
+
+
+# --------------------------------------------------------------------------
+# Content discovery
+# --------------------------------------------------------------------------
+
+def run_feroxbuster(target, wordlist, outdir):
+    if not wordlist:
+        print(f"{WARN} no URL wordlist provided (-wu), skipping feroxbuster.")
+        return None
+    out = os.path.join(outdir, "feroxbuster_results.txt")
+    cmd = ["feroxbuster", "-u", target, "-w", wordlist, "-o", out,
+           "-s", "200,204,301,302,307,401,403"]
+    run_tool(cmd, "feroxbuster")
+    return out
+
+
+# --------------------------------------------------------------------------
+# Parameter discovery
+# --------------------------------------------------------------------------
+
+def run_arjun(target, wordlist, outdir):
+    out = os.path.join(outdir, "arjun_results.txt")
+    cmd = ["arjun", "-u", target, "-oT", out]
+    if wordlist:
+        cmd += ["-w", wordlist]
+    run_tool(cmd, "Arjun")
+    return out
+
+
+# --------------------------------------------------------------------------
+# OWASP WSTG folder scaffolding
+# --------------------------------------------------------------------------
+
+def create_wstg_structure(outdir):
+    wstg_root = os.path.join(outdir, "WSTG")
+    os.makedirs(wstg_root, exist_ok=True)
+    for code, description in WSTG_SECTIONS.items():
+        section_dir = os.path.join(wstg_root, code)
+        os.makedirs(section_dir, exist_ok=True)
+        notes_path = os.path.join(section_dir, "notes.txt")
+        tests_path = os.path.join(section_dir, "tests.txt")
+        if not os.path.isfile(notes_path):
+            with open(notes_path, "w") as fh:
+                fh.write(f"{code} - {description}\nNotes:\n")
+        if not os.path.isfile(tests_path):
+            with open(tests_path, "w") as fh:
+                fh.write(f"{code} - {description}\nTests performed / to perform:\n")
+    print(f"{OK} WSTG folder structure created at {wstg_root}")
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="AutoRecon V1.0",
+        description="An automated recon tool to kick off bug bounty hunting.",
+        epilog="Created by Ahmed Nasser (shadow64)",
+    )
+    parser.add_argument("-u", "--url", required=True,
+                         help="Target URL, e.g. https://example.com")
+    parser.add_argument("-ws", "--word-list-subs",
+                         help="Wordlist path for ffuf subdomain brute force (optional)")
+    parser.add_argument("-wu", "--word-list-urls",
+                         help="Wordlist path for feroxbuster URL brute force (optional)")
+    parser.add_argument("-pw", "--parameters-word-list",
+                         help="Wordlist path for Arjun (optional)")
+    parser.add_argument("-js", "--download-js",
+                         choices=["yes", "no"], required=True,
+                         help="yes/no - download all discovered JS files into a separate js_files folder")
+    parser.add_argument("-wstg", "--owasp-wstg-folders",
+                         choices=["yes", "no"], required=True,
+                         help="yes/no - create OWASP WSTG section folders with notes.txt and tests.txt")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    target = args.url
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    domain = get_domain(target)
+    if not domain:
+        print(f"{ERR} could not parse a domain from {target}")
+        sys.exit(1)
+
+    check_target_alive(target)
+    outdir = make_outdir(domain)
+    print(f"{INFO} results will be saved under {outdir}")
+
+    # --- Subdomain enumeration ---
+    subfinder_out = run_subfinder(domain, outdir)
+    sublist3r_out = run_sublist3r(domain, outdir)
+    amass_out = run_amass(domain, outdir)
+    ffuf_out = run_ffuf_subs(domain, args.word_list_subs, outdir)
+    all_subs = merge_lines(
+        [subfinder_out, sublist3r_out, amass_out, ffuf_out],
+        outdir, "all_subdomains.txt", "subdomains"
+    )
+
+    # --- Probing ---
+    alive_hosts = run_httpx(all_subs, outdir)
+
+    # --- URL discovery ---
+    katana_out = run_katana(alive_hosts, outdir)
+    wayback_out = run_waybackurls(domain, outdir)
+    all_urls = merge_lines([katana_out, wayback_out], outdir, "all_urls.txt", "URLs")
+
+    # --- JS analysis ---
+    run_linkfinder(all_urls, outdir)
+
+    # --- JS file download ---
+    if args.download_js == "yes":
+        download_js_files(all_urls, outdir)
+
+    # --- Content discovery ---
+    run_feroxbuster(target, args.word_list_urls, outdir)
+
+    # --- Parameter discovery ---
+    run_arjun(target, args.parameters_word_list, outdir)
+
+    # --- WSTG note-taking structure ---
+    if args.owasp_wstg_folders == "yes":
+        create_wstg_structure(outdir)
+
+    print(f"{OK} recon finished. Check the '{outdir}' folder for all results.")
+
+
+if __name__ == "__main__":
+    main()
